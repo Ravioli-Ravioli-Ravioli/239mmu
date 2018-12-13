@@ -3,41 +3,56 @@
 #include <stddef.h>
 #include <time.h>
 
-#define N 1000
+#define BLOCK_WIDTH 16
+#define TILE_WIDTH 16
+#define width 2
 
-////////////////////////////Each thread 1 row 1 column
-__global__ void kernel_1t1e(float A[N][N], float B[N][N], float C[N][N], int size) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    int j = blockIdx.y * blockDim.y + threadIdx.y;
-    if (i < size && j < size){
-        A[i][j] = B[i][j] + C[i][j];
+//GlobalMem - From Kirk and Hwu, 2012, 
+__global__ void matrixMulKernel(float* d_M, float* d_N, float* d_P, int Width) {
+   // Calculate the row index of the d_Pelement and d_M
+   int Row = blockIdx.y*blockDim.y+threadIdx.y;
+   // Calculate the column index of d_P and d_N
+   int Col = blockIdx.x*blockDim.x+threadIdx.x;
+
+   if ((Row < Width) && (Col < Width)) {
+      float Pvalue = 0;
+      // each thread computes one element of the block sub-matrix
+      for (int k = 0; k < Width; ++k) {
+      Pvalue += d_M[Row*Width+k]*d_N[k*Width+Col];
+      }
+      d_P[Row*Width+Col] = Pvalue;
     }
 }
-///////////////////////////Each thread 1 row
-__global__ void kernel_1t1r(float A[N][N], float B[N][N], float C[N][N], int size) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < size){
-	for (int j = 0; j < size; j++){
-        A[i][j] = B[i][j] + C[i][j];
-	}
-    }
-}
-///////////////////////////Each thread 1 column
-__global__ void kernel_1t1c(float A[N][N], float B[N][N], float C[N][N], int size) {
-    int j = blockIdx.y * blockDim.y + threadIdx.y;
-    if (j < size){
-        for (int i = 0; i < size; i++){
-        A[i][j] = B[i][j] + C[i][j];
-        }
-    }
+//
+__global__ void matrixMulKernel2(float* d_M, float* d_N, float* d_P,
+int Width) {
+   __shared__ float Mds[TILE_WIDTH][TILE_WIDTH];
+   __shared__ float Nds[TILE_WIDTH][TILE_WIDTH];
+   int bx = blockIdx.x; int by = blockIdx.y;
+   int tx = threadIdx.x; int ty = threadIdx.y;
+   // Identify the row and column of the d_P element to work on
+   int Row = by * TILE_WIDTH + ty;
+   int Col = bx * TILE_WIDTH + tx;
+   float Pvalue = 0;
+   // Loop over the d_M and d_N tiles required to compute d_P element
+   for (int m = 0; m < Width/TILE_WIDTH; ++m) {
+   // Coolaborative loading of d_M and d_N tiles into shared memory
+      Mds[ty][tx] = d_M[Row*Width + m*TILE_WIDTH + tx];
+      Nds[ty][tx] = d_N[(m*TILE_WIDTH + ty)*Width + Col];
+      __syncthreads();
+      for (int k = 0; k < TILE_WIDTH; ++k) {
+        Pvalue += Mds[ty][k] * Nds[k][tx];
+      }
+      __syncthreads();
+   }
+   d_P[Row*Width + Col] = Pvalue;
 }
 
+//Main
 int main(void){
-  int nDevices;
-  int i, j;
-  float A[N][N], B[N][N], C[N][N], (*A_d)[N], (*B_d)[N], (*C_d)[N];
 
 //Print device properties
+  int nDevices;
   cudaGetDeviceCount(&nDevices);
   for (int i = 0; i < nDevices; i++) {
     cudaDeviceProp prop;
@@ -57,102 +72,61 @@ int main(void){
     printf("  Warp Size: %d\n",
            prop.warpSize);
   }
+
+//Allocate memory in host RAM
+  float *A_h, *B_h, *C_h;
+  cudaMallocHost((void **) &A_h, (width*width)*sizeof(float));
+  cudaMallocHost((void **) &B_h, (width*width)*sizeof(float));
+  cudaMallocHost((void **) &C_h, (width*width)*sizeof(float));
+//Allocate memory in device RAM
+  float *A_d, *B_d, *C_d;
+  cudaMalloc((void **) &A_d, (width*width)*sizeof(float));
+  cudaMalloc((void **) &B_d, (width*width)*sizeof(float));
+  cudaMalloc((void **) &C_d, (width*width)*sizeof(float));
 //Populate First Matrix
+   int i, j; 
    srand(1);
-   for (i = 0; i < N; i++){
-      for (j = 0; j < N; j++) {
-         B[i][j] = ((float)rand()/(float)(RAND_MAX)) * 100;
-//         printf("%f  ", B[i][j]);
+   for (i = 0; i < width; i++){
+      for (j = 0; j < width; j++) {
+         A_h[i*width + j] = ((float)rand()/(float)(RAND_MAX)) * 100;
+         printf("%.2f  ", A_h[i*width + j]);
       }
       printf("\n");
    }
    printf("\n");
 //Populate Second Matrix
-   for (i = 0; i < N; i++){
-      for (j = 0; j < N; j++) {
-         C[i][j] = ((float)rand()/(float)(RAND_MAX)) * 100;
-//	 printf("%f  ", C[i][j]);
+   for (i = 0; i < width; i++){
+      for (j = 0; j < width; j++) {
+         B_h[i*width + j] = ((float)rand()/(float)(RAND_MAX)) * 100;
+	 printf("%.2f  ", B_h[i*width + j]);
       }
      printf("\n");
    }
-   printf("\n");
-   printf("===============================");
-   printf("\n");
-
-//Allocate memory in the device
-   
-   cudaMalloc((void**) &A_d, (N*N)*sizeof(float));
-   cudaMalloc((void**) &B_d, (N*N)*sizeof(float));
-   cudaMalloc((void**) &C_d, (N*N)*sizeof(float));
-
 //Mem copy from host to device
-   cudaMemcpy(A_d, A, (N*N)*sizeof(float), cudaMemcpyHostToDevice);
-   cudaMemcpy(B_d, B, (N*N)*sizeof(float), cudaMemcpyHostToDevice);
-   cudaMemcpy(C_d, C, (N*N)*sizeof(float), cudaMemcpyHostToDevice);
-
-   dim3 threadsPerBlock(N, N);
-   dim3 numBlocks(N / threadsPerBlock.x, N / threadsPerBlock.y);
-
-   cudaEvent_t start, stop;
-   float elapsed = 0;
-
-//ThreadAll
-
-//Run
-   cudaEventCreate(&start);
-   cudaEventCreate(&stop);
-   cudaEventRecord(start, 0);
-   kernel_1t1e<<<numBlocks,threadsPerBlock>>>(A_d, B_d, C_d, N);
-   cudaEventRecord(stop, 0);
-
-   cudaEventSynchronize(stop);
-   cudaEventElapsedTime(&elapsed, start, stop);
-   cudaEventDestroy(start);
-   cudaEventDestroy(stop);
-   printf("GPU Run TIme threadsall %.2f ms \n", elapsed);
-
-////////////////////////////////////Thread Row
-/*
-   cudaEventCreate(&start);
-   cudaEventCreate(&stop);
-   cudaEventRecord(start, 0);
-   kernel_1t1r<<<numBlocks,threadsPerBlock>>>(A_d, B_d, C_d, N);
-   cudaEventRecord(stop, 0);
-
-   cudaEventSynchronize(stop);
-   cudaEventElapsedTime(&elapsed, start, stop);
-   cudaEventDestroy(start);
-   cudaEventDestroy(stop);
-   printf("GPU Run TIme threadsrow %.2f ms \n", elapsed);
-
-////////////////////////////////////Thread Column
-
-   cudaEventCreate(&start);
-   cudaEventCreate(&stop);
-   cudaEventRecord(start, 0);
-   kernel_1t1c<<<numBlocks,threadsPerBlock>>>(A_d, B_d, C_d, N);
-   cudaEventRecord(stop, 0);
-
-   cudaEventSynchronize(stop);
-   cudaEventElapsedTime(&elapsed, start, stop);
-   cudaEventDestroy(start);
-   cudaEventDestroy(stop);
-   printf("GPU Run TIme threadscol %.2f ms \n", elapsed);
-*/
+   cudaMemcpy(A_d, A_h, (width*width)*sizeof(float), cudaMemcpyHostToDevice);
+   cudaMemcpy(B_d, B_h, (width*width)*sizeof(float), cudaMemcpyHostToDevice);
+   cudaMemcpy(C_d, C_h, (width*width)*sizeof(float), cudaMemcpyHostToDevice);
+//From Kirk and Hwu, 2012
+   int NumBlocks = width/BLOCK_WIDTH;
+   if (width % BLOCK_WIDTH) NumBlocks++;
+   dim3 dimGrid(NumBlocks, NumBlocks);
+   dim3 dimBlock(BLOCK_WIDTH, BLOCK_WIDTH);
+//   matrixMulKernel<<<dimGrid, dimBlock>>>(A_d, B_d, C_d, width);
+   matrixMulKernel2<<<dimGrid, dimBlock>>>(A_d, B_d, C_d, width);
 //Mem Copy
-   cudaMemcpy(A, A_d, (N*N)*sizeof(float), cudaMemcpyDeviceToHost);
-
-/////////////////////////////////////Print matrix A
-
-   for (i = 0; i < N; i++){
-      for (j = 0; j < N; j++) {
-         printf("%f  ", A[i][j]);
+     cudaMemcpy(C_h, C_d, (width*width)*sizeof(float), cudaMemcpyDeviceToHost);
+//Print matrix A
+   for (i = 0; i < width; i++){
+      for (j = 0; j < width; j++) {
+         printf("%.2f  ", C_h[i*width + j]);
       }
       printf("\n");
    }
    printf("\n");
-	
-/////////////////////////////////////Free up memory
+//Free up memory
+   cudaFree(A_h);
+   cudaFree(B_h);
+   cudaFree(C_h);
    cudaFree(A_d); 
    cudaFree(B_d); 
    cudaFree(C_d);
